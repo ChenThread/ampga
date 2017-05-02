@@ -1,7 +1,10 @@
 #!/bin/sh
 cc -O3 -g -o filter-output filter-output.c && \
+cc -O3 -g -o cursorama cursorama.c -lpq && \
 cat ampga.pgsql | docker exec -i sql psql && \
-docker exec -i sql psql -A -t -1 -c "copy (select * from ampga_play_mod('starmem.mod', 48000)) to stdout;" | ./filter-output | ffmpeg -v 0 -f u8 -ar 48000 -ac 1 -i - -f wav - 2>/dev/null | play -twav - 2>/dev/null
+./cursorama | ffmpeg -v 0 -f u8 -ar 48000 -ac 1 -i - -f wav - 2>/dev/null | play -twav - 2>/dev/null
+
+#docker exec -i sql psql -A -t -1 -c "copy (select * from ampga_play_mod('test.mod', 48000)) to stdout;" | ./filter-output | ffmpeg -v 0 -f u8 -ar 48000 -ac 1 -i - -f wav - 2>/dev/null | play -twav - 2>/dev/null
 
 #docker exec -i sql psql -A -t -1 -c "copy (select * from ampga_play_mod('test.mod', 48000)) to stdout;" | ./filter-output >donk.raw
 

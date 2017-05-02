@@ -25,6 +25,7 @@
 drop table if exists ampga_mod_samples;
 drop table if exists ampga_mod_pattern_cells;
 drop table if exists ampga_mod_orders;
+drop table if exists ampga_mod_filedata;
 
 -- Create tables
 create table ampga_mod_samples (
@@ -35,7 +36,7 @@ create table ampga_mod_samples (
     smp_vol int not null,
     smp_lpbeg int not null,
     smp_lplen int not null,
-    smp_data bytea not null);
+    smp_dataoffs int not null);
 create table ampga_mod_pattern_cells (
     id serial primary key not null,
     pat_idx int not null,
@@ -48,6 +49,18 @@ create table ampga_mod_pattern_cells (
 create table ampga_mod_orders (
     id int primary key not null,
     pattern_id int not null);
+create table ampga_mod_filedata (
+    id int primary key not null,
+    order_count int not null,
+    pattern_count int not null,
+    mod_speed int not null default 6,
+    mod_tempo int not null default 125,
+    mod_tick int not null default 0,
+    mod_ord int not null default -1,
+    mod_pat int not null default 0,
+    mod_row int not null default 64,
+    mod_newrow int not null default 64,
+    fdata bytea not null);
 
 -- Create indexes
 -- (probably slightly overkill here)
@@ -111,6 +124,16 @@ create or replace function ampga_play_mod(fname text, mixfreq int) returns setof
     mod_row int;
     mod_new_row int;
 
+    -- Mixer
+    mix_buf int[];
+    mix_smpbeg int;
+    mix_smpend int;
+    mix_lplen int;
+    mix_freq int;
+    mix_vol int;
+    mix_offs int;
+    mix_suboffs int;
+
     -- Channels
     chn_smp int[4];
     chn_offs int[4];
@@ -120,7 +143,7 @@ create or replace function ampga_play_mod(fname text, mixfreq int) returns setof
     chn_vol int[4];
     chn_len int[4];
     chn_lplen int[4];
-    chn_data ampga_mod_samples[4];
+    chn_dataoffs int[4];
 
     -- Pattern cells
     l_pat_period int;
@@ -141,6 +164,7 @@ create or replace function ampga_play_mod(fname text, mixfreq int) returns setof
     delete from ampga_mod_samples;
     delete from ampga_mod_pattern_cells;
     delete from ampga_mod_orders;
+    delete from ampga_mod_filedata;
 
     -- Read order table
     --
@@ -176,7 +200,7 @@ create or replace function ampga_play_mod(fname text, mixfreq int) returns setof
     for i in 0..30 loop
       j := ((get_byte(fdata, 20+30*i+22)<<8) + get_byte(fdata, 20+30*i+23))*2;
       insert into ampga_mod_samples
-          (id, smp_name, smp_len, smp_ft, smp_vol, smp_lpbeg, smp_lplen, smp_data)
+          (id, smp_name, smp_len, smp_ft, smp_vol, smp_lpbeg, smp_lplen, smp_dataoffs)
         values (
           i+1,
           ampga_intern_read_str(substring(fdata from (1+20+30*i) for 22)),
@@ -185,7 +209,7 @@ create or replace function ampga_play_mod(fname text, mixfreq int) returns setof
           get_byte(fdata, 20+30*i+25),
           ((get_byte(fdata, 20+30*i+26)<<8) + get_byte(fdata, 20+30*i+27))*2,
           ((get_byte(fdata, 20+30*i+28)<<8) + get_byte(fdata, 20+30*i+29))*2,
-          substring(fdata from (acc+1) for j));
+          acc);
       acc := acc + j;
     end loop;
     for i in 0..30 loop
@@ -233,8 +257,8 @@ create or replace function ampga_play_mod(fname text, mixfreq int) returns setof
     --
     outbuf_len_prev := -1;
 
-    --for time_limiter in 0..(6*64*256) loop
-    for time_limiter in 0..(6*64*8) loop
+    for time_limiter in 0..(6*64*256) loop
+    --for time_limiter in 0..(6*64*12) loop
 
       -- Handle next tick
       if mod_tick <= 0 then
@@ -252,6 +276,7 @@ create or replace function ampga_play_mod(fname text, mixfreq int) returns setof
           -- Fetch new pattern
           mod_ord := mod_ord + 1;
           if mod_ord >= order_count then
+            return; -- Might as well bail out now
             mod_ord := 0;
           end if;
 
@@ -259,6 +284,8 @@ create or replace function ampga_play_mod(fname text, mixfreq int) returns setof
             from ampga_mod_orders
             where id = mod_ord
             limit 1);
+
+          raise notice 'Order % - Pattern % - Row %', mod_ord, mod_pat, mod_row;
         end if;
         mod_new_row := mod_row + 1;
 
@@ -285,7 +312,7 @@ create or replace function ampga_play_mod(fname text, mixfreq int) returns setof
                 where id = l_pat_sample_id
                 limit 1) loop
 
-              chn_data[j] := r2;
+              chn_dataoffs[j] := r2.smp_dataoffs;
               -- TODO: factor in loop start
               chn_len[j] := r2.smp_len;
               chn_lplen[j] := r2.smp_lplen;
@@ -306,7 +333,6 @@ create or replace function ampga_play_mod(fname text, mixfreq int) returns setof
             chn_vol[j] := coalesce(chn_vol[j], 64);
           end if;
 
-          -- TODO: more than just this hack
           case l_pat_eff_type
             when 12 then
               chn_vol[j] := l_pat_eff_val;
@@ -314,7 +340,41 @@ create or replace function ampga_play_mod(fname text, mixfreq int) returns setof
                 chn_vol[j] := 64;
               end if;
             when 13 then
-              mod_new_row := 64;
+              mod_new_row := 64 + l_pat_eff_val;
+            when 14 then
+              k := l_pat_eff_val;
+              l_pat_eff_val := l_pat_eff_val & 15;
+              case k
+                when 1 then
+                  chn_per[j] := chn_per[j] + l_pat_eff_val;
+                  if chn_per[j] > 856 then
+                    chn_per[j] := 856;
+                  end if;
+                when 2 then
+                  chn_per[j] := chn_per[j] + l_pat_eff_val;
+                  if chn_per[j] > 856 then
+                    chn_per[j] := 856;
+                  end if;
+                when 10 then
+                  chn_vol[j] := chn_vol[j] + l_pat_eff_val;
+                  if chn_vol[j] > 64 then
+                    chn_vol[j] := 64;
+                  end if;
+                when 11 then
+                  chn_vol[j] := chn_vol[j] - l_pat_eff_val;
+                  if chn_vol[j] < 0 then
+                    chn_vol[j] := 0;
+                  end if;
+                else
+                  k := k;
+              end case;
+            when 15 then
+              if l_pat_eff_val >= 32 then
+                mod_tempo := l_pat_eff_val;
+              elsif l_pat_eff_val >= 1 then
+                mod_speed := l_pat_eff_val;
+                mod_tick := l_pat_eff_val-1;
+              end if;
             else
               mod_row := mod_row;
           end case;
@@ -337,6 +397,40 @@ create or replace function ampga_play_mod(fname text, mixfreq int) returns setof
           j := r.pat_col;
 
           case l_pat_eff_type
+            when 1 then
+              chn_per[j] := chn_per[j] + l_pat_eff_val;
+              if chn_per[j] > 856 then
+                chn_per[j] := 856;
+              end if;
+            when 2 then
+              chn_per[j] := chn_per[j] - l_pat_eff_val;
+              if chn_per[j] < 113 then
+                chn_per[j] := 113;
+              end if;
+            when 5 then
+              if (l_pat_eff_val & 15) = 0 then
+                chn_vol[j] := chn_vol[j] + (l_pat_eff_val >> 4);
+                if chn_vol[j] > 64 then
+                  chn_vol[j] := 64;
+                end if;
+              elsif (l_pat_eff_val >> 4) = 0 then
+                chn_vol[j] := chn_vol[j] - (l_pat_eff_val & 15);
+                if chn_vol[j] < 0 then
+                  chn_vol[j] := 0;
+                end if;
+              end if;
+            when 6 then
+              if (l_pat_eff_val & 15) = 0 then
+                chn_vol[j] := chn_vol[j] + (l_pat_eff_val >> 4);
+                if chn_vol[j] > 64 then
+                  chn_vol[j] := 64;
+                end if;
+              elsif (l_pat_eff_val >> 4) = 0 then
+                chn_vol[j] := chn_vol[j] - (l_pat_eff_val & 15);
+                if chn_vol[j] < 0 then
+                  chn_vol[j] := 0;
+                end if;
+              end if;
             when 10 then
               if (l_pat_eff_val & 15) = 0 then
                 chn_vol[j] := chn_vol[j] + (l_pat_eff_val >> 4);
@@ -358,6 +452,7 @@ create or replace function ampga_play_mod(fname text, mixfreq int) returns setof
 
       -- Reset output buffer if necessary
       outbuf_len := mixfreq*10/(mod_tempo*4);
+      mix_buf := array_fill(0, ARRAY[outbuf_len]);
       if outbuf_len <> outbuf_len_prev then
         outbuf := E'';
         for i in 0..(outbuf_len - 1) loop
@@ -376,33 +471,54 @@ create or replace function ampga_play_mod(fname text, mixfreq int) returns setof
         chn_freq[j] = (4096*chn_freq[j])/mixfreq;
       end loop;
 
-      -- Fill output buffer
-      for i in 0..(outbuf_len - 1) loop
-        v := 0;
+      -- Mix per channel
+      for j in 1..4 loop
+        -- Skip various cases
+        continue when chn_smp[j] = 0;
+        continue when chn_per[j] = 0;
+        continue when chn_offs[j] = -1;
 
-        -- Mix each channel
-        for j in 1..4 loop
-          -- Skip various cases
-          continue when chn_smp[j] = 0;
-          continue when chn_per[j] = 0;
-          continue when chn_offs[j] = -1;
+        -- Preload constants
+        mix_smpbeg := chn_dataoffs[j];
+        mix_smpend := chn_dataoffs[j] + chn_len[j];
+        mix_lplen := chn_lplen[j];
+        mix_freq := chn_freq[j];
+        mix_vol := chn_vol[j];
 
-          u := coalesce(get_byte(chn_data[j].smp_data, chn_offs[j]),0);
-          v := v + (((u+128)&255)-128)*coalesce(chn_vol[j], 64);
-          chn_suboffs[j] := chn_suboffs[j] + chn_freq[j];
-          chn_offs[j] := chn_offs[j] + (chn_suboffs[j]>>12);
-          chn_suboffs[j] := chn_suboffs[j] & 4095;
-          if chn_offs[j] >= chn_len[j] then
-            if chn_lplen[j] > 2 then
-              chn_offs[j] := chn_offs[j] - chn_lplen[j];
-              if chn_offs[j] >= chn_len[j] or chn_offs[j] < 0 then
-                chn_offs[j] := -1;
+        -- Preload variables
+        mix_offs := chn_offs[j] + mix_smpbeg;
+        mix_suboffs := chn_suboffs[j];
+
+        -- Add to mixing buffer
+        for i in 1..outbuf_len loop
+          u := get_byte(fdata, mix_offs);
+          mix_buf[i] := mix_buf[i] + (((u+128)&255)-128)*mix_vol;
+          mix_suboffs := mix_suboffs + mix_freq;
+          mix_offs := mix_offs + (mix_suboffs>>12);
+          mix_suboffs := mix_suboffs & 4095;
+          if mix_offs >= mix_smpend then
+            if mix_lplen > 2 then
+              mix_offs := mix_offs - mix_lplen;
+              if mix_offs >= mix_smpend or mix_offs < mix_smpbeg then
+                mix_offs := mix_smpbeg-1;
+                exit;
               end if;
             else
-              chn_offs[j] := -1;
+              mix_offs := mix_smpbeg-1;
+              exit;
             end if;
           end if;
         end loop;
+
+        -- Write variables back
+        chn_offs[j] := mix_offs - mix_smpbeg;
+        chn_suboffs[j] := mix_suboffs;
+      end loop;
+
+      -- Fill output buffer
+      for i in 1..outbuf_len loop
+        -- Fetch
+        v := mix_buf[i];
 
         -- Clamp
         v := v / 100;
@@ -411,7 +527,7 @@ create or replace function ampga_play_mod(fname text, mixfreq int) returns setof
         if v < 0   then v = 0  ; end if;
 
         -- Set byte
-        outbuf := set_byte(outbuf, i, v);
+        outbuf := set_byte(outbuf, i-1, v);
       end loop;
 
       -- Output!
